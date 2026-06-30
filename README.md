@@ -6,6 +6,7 @@
 ![YOLO11](https://img.shields.io/badge/Model-YOLO11n-purple)
 ![OpenCV](https://img.shields.io/badge/Geometrie-Homographie-green)
 ![Streamlit](https://img.shields.io/badge/Interface-Streamlit-red)
+![Tests](https://img.shields.io/badge/Tests-pytest-yellow)
 ![Status](https://img.shields.io/badge/Status-Portfolio%20PoC-orange)
 
 ---
@@ -18,7 +19,7 @@ Les etudes de trafic classiques (boucles inductives, comptage pneumatique) coute
 
 Transformer n'importe quelle camera fixe existante en station de comptage et de mesure de vitesse. Le pipeline detecte les vehicules (YOLO11), les suit individuellement entre les frames (ByteTrack), et estime leur vitesse reelle en km/h grace a une transformation de perspective (homographie). Tout tourne en local.
 
-## Architecture
+## Architecture du traitement
 
 ```
 Video MP4 (camera fixe)
@@ -27,7 +28,7 @@ Video MP4 (camera fixe)
 Frame N (image BGR)
     |  [YOLO11n + ByteTrack]
     v
-Detections + Track IDs (x, y, w, h, id, class)
+Detections + identifiants de suivi (x, y, w, h, id, classe)
     |  [Homographie : cv2.getPerspectiveTransform]
     v
 Position dans le plan routier (metres)
@@ -36,8 +37,26 @@ Position dans le plan routier (metres)
 Vitesse par vehicule (km/h)
     |  [Annotation OpenCV]
     v
-Video annotee (boxes + ID + vitesse) --> Streamlit
+Video annotee (boites + ID + vitesse)
 ```
+
+## Architecture logicielle
+
+Le projet separe strictement la logique metier de l'interface utilisateur. Le package `trafficpulse` ne depend d'aucune librairie d'interface (ni Streamlit, ni argparse) : il peut etre teste, importe et reutilise independamment.
+
+| Module | Role |
+|---|---|
+| `trafficpulse/config.py` | Parametres du pipeline (dataclass validee), detection automatique du device |
+| `trafficpulse/calibration.py` | Calibrateur homographique, validation geometrique, sauvegarde/chargement JSON |
+| `trafficpulse/tracking.py` | Estimation de vitesse a partir de l'historique de positions |
+| `trafficpulse/annotation.py` | Classes vehicules et annotation visuelle des frames |
+| `trafficpulse/pipeline.py` | Orchestration complete : detection, suivi, vitesse, export CSV |
+| `cli.py` | Point d'entree ligne de commande (traitement par lot, scripts) |
+| `app.py` | Interface Streamlit, consommateur du package, aucune logique dupliquee |
+| `calibration_tool.py` | Outil interactif de selection des points de calibration |
+| `tests/` | Tests unitaires de la calibration et de l'estimation de vitesse |
+
+`app.py` et `cli.py` appellent tous les deux `TrafficPulsePipeline`, ce qui garantit un comportement identique quelle que soit l'interface utilisee.
 
 ## Stack technique
 
@@ -47,8 +66,9 @@ Video annotee (boxes + ID + vitesse) --> Streamlit
 | Tracking | ByteTrack (Ultralytics natif) | Filtre de Kalman + association IoU |
 | Geometrie | OpenCV (getPerspectiveTransform) | Projection image -> plan metrique |
 | Cinematique | NumPy | Derivee discrete lissee V = d/dt |
-| Video I/O | OpenCV (VideoCapture/Writer) | Lecture et ecriture MP4 |
+| Video I/O | OpenCV (VideoCapture/Writer), repli automatique de codec | Lecture et ecriture MP4 |
 | Interface | Streamlit | Upload + parametrage + telechargement resultat |
+| Tests | pytest | Calibration et estimation de vitesse testees sans dependance au modele |
 
 ## Resultats
 
@@ -62,34 +82,61 @@ Video annotee (boxes + ID + vitesse) --> Streamlit
 ## Structure du projet
 
 ```
-TrafficPulse/
-├── README.md
-├── requirements.txt
-├── traffic_pulse.py             # Code complet (pipeline + Streamlit gen)
-├── cours_trafficpulse.md        # Cours pedagogique
-├── app.py                       # Interface Streamlit (generee)
-└── traffic_video.mp4            # Video de test (a fournir)
+PulseTraffic/
+  README.md
+  requirements.txt
+  requirements-dev.txt
+  conftest.py
+  cli.py                       (point d'entree CLI, argparse)
+  app.py                       (interface Streamlit)
+  calibration_tool.py          (outil interactif de calibration)
+  trafficpulse/
+    __init__.py
+    config.py
+    calibration.py
+    tracking.py
+    annotation.py
+    pipeline.py
+    logging_utils.py
+  tests/
+    test_calibration.py
+    test_tracking.py
+  traffic_video.mp4            (video de test a fournir, non versionnee)
 ```
 
 ## Installation et execution
 
 ```bash
 # Cloner
-git clone https://github.com/<votre-username>/TrafficPulse.git
-cd TrafficPulse
+git clone https://github.com/Benoth08/PulseTraffic.git
+cd PulseTraffic
 
-# Installer
+# Installer (utiliser requirements-dev.txt pour lancer aussi les tests)
 pip install -r requirements.txt
 
 # Telecharger une video de trafic (camera fixe) depuis :
 #   https://www.pexels.com/search/videos/traffic/
 # et la nommer traffic_video.mp4
 
-# Option 1 : Script direct
-python traffic_pulse.py
+# Option 1 : CLI
+python cli.py --input traffic_video.mp4 --output result.mp4
 
 # Option 2 : Interface Streamlit
 streamlit run app.py
+```
+
+Le CLI accepte plusieurs options utiles en production :
+
+```bash
+python cli.py \
+    --input traffic_video.mp4 \
+    --output result.mp4 \
+    --calib-file calibration.json \
+    --confidence 0.35 \
+    --smoothing-window 5 \
+    --max-speed 150 \
+    --csv-export vehicules.csv \
+    --log-level INFO
 ```
 
 ## Calibration de l'homographie
@@ -99,9 +146,14 @@ C'est l'etape critique qui requiert une intervention manuelle :
 1. Identifier dans la video un rectangle au sol de dimensions connues (passage pieton, marquage de voie, espacement entre bandes blanches)
 2. Relever les 4 coins en pixels (P1 bas-gauche, P2 bas-droit, P3 haut-droit, P4 haut-gauche)
 3. Definir les coordonnees reelles correspondantes en metres
-4. Reporter ces valeurs dans l'interface Streamlit (sidebar)
+4. Sauvegarder cette calibration au format JSON, reutilisable ensuite par le CLI (`--calib-file`) ou l'interface Streamlit (chargement de fichier)
 
-Un outil de calibration interactif (clic sur l'image) est inclus dans le code pour faciliter cette etape en local.
+Deux methodes pour obtenir ces points :
+
+- `python calibration_tool.py traffic_video.mp4 calibration.json` : outil interactif en local (clic sur l'image), genere directement le fichier JSON
+- Saisie manuelle des 8 valeurs dans la barre laterale de l'interface Streamlit, avec export possible vers JSON
+
+Les points de calibration sont valides automatiquement avant tout traitement : un quadrilatere degenere (points confondus ou alignes) est rejete avec un message explicite plutot que de produire des vitesses silencieusement fausses.
 
 ## Concepts physiques cles
 
@@ -109,21 +161,37 @@ Un outil de calibration interactif (clic sur l'image) est inclus dans le code po
 Matrice 3x3 qui mappe le plan image vers le plan routier. Hypothese : la route est plane. Necessite 4 correspondances point image <-> point reel.
 
 ### Point de contact au sol
-On projette le centre de la BASE de la bounding box (x_center, y_bottom), pas le centre geometrique. Le bas de la boite est le contact vehicule/route, seul point dans le plan de l'homographie.
+On projette le centre de la base de la boite englobante (x_center, y_bottom), pas le centre geometrique. Le bas de la boite est le contact vehicule/route, seul point reellement situe dans le plan de l'homographie.
 
 ### Vitesse par derivee discrete lissee
-V(t) = ||P(t) - P(t-N)|| / (N/FPS). Le lissage sur N frames (defaut: 5) reduit le bruit du tracking. A 30 fps, N=5 correspond a un lissage sur 167 ms.
+Sur une fenetre de N positions consecutives (une par frame), l'ecart entre la position la plus recente et la plus ancienne couvre N-1 intervalles de temps, pas N :
+
+```
+V(t) = ||P(t) - P(t-(N-1))|| / ((N-1) / fps)
+```
+
+A 30 fps, N=5 correspond a un lissage sur 4 intervalles, soit 133 ms.
 
 ### V85
 Le 85e percentile des vitesses mesurees. Indicateur standard en ingenierie du trafic pour dimensionner les infrastructures.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest tests/ -v
+```
+
+Les tests couvrent la calibration (precision de projection sur points connus, rejet des quadrilateres degeneres, sauvegarde/chargement JSON) et l'estimation de vitesse (calcul sur deplacement connu, filtrage des vitesses aberrantes, liberation memoire des vehicules inactifs). Ils ne dependent ni du modele YOLO ni d'une video, et s'executent en moins d'une seconde.
 
 ## Limitations
 
 - **Camera fixe obligatoire** : tout mouvement invalide l'homographie
 - **Plan routier** : les pentes biaisent la projection
 - **Non homologue** : precision de 5-15%, pas un radar certifie
-- **ID switches** : le tracker peut perdre un vehicule (occlusion) et generer des vitesses aberrantes (filtrees par seuil)
+- **Changements d'identifiant de suivi** : le tracker peut perdre un vehicule (occlusion) et generer des vitesses aberrantes, filtrees par seuil configurable
 - **FPS critique** : en dessous de 15 fps, l'estimation de vitesse se degrade
+- **Codec video** : le writer tente H264 (avc1) en priorite pour une lecture native dans le navigateur, avec repli automatique sur mp4v puis XVID selon les codecs disponibles sur le systeme
 
 ## Extensions possibles
 
@@ -131,8 +199,10 @@ Le 85e percentile des vitesses mesurees. Indicateur standard en ingenierie du tr
 - Detection d'incidents (vehicule arrete, contresens)
 - Heatmap de densite de trafic
 - Temps de parcours entre deux cameras
-- Export des donnees en CSV pour analyse statistique
 - Integration avec un systeme de gestion de trafic (SCADA)
+- Conteneurisation (Dockerfile) pour deploiement sur poste distant
+
+L'export CSV par vehicule (`--csv-export`) est deja disponible via le CLI.
 
 ## Auteur
 
