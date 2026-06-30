@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Tuple, Union
 
@@ -25,6 +26,39 @@ MIN_QUAD_AREA_PX = 100.0
 
 class CalibrationError(ValueError):
     """Erreur levee lorsque les points de calibration sont invalides."""
+
+
+class BaseCalibrator(ABC):
+    """Interface commune aux calibrateurs homographiques.
+
+    Le pipeline de traitement (trafficpulse.pipeline) ne manipule que cette
+    interface : il n'a pas besoin de savoir si la calibration a ete obtenue
+    manuellement (HomographyCalibrator) ou automatiquement par appariement
+    de points d'interet (AutoHomographyCalibrator).
+    """
+
+    @abstractmethod
+    def image_to_world(self, px: float, py: float) -> Tuple[float, float]:
+        """Projette un point image (px, py) dans le plan metrique."""
+
+    @abstractmethod
+    def world_to_image(self, mx: float, my: float) -> Tuple[float, float]:
+        """Projette un point metrique vers l'image (transformation inverse)."""
+
+    @abstractmethod
+    def draw_calibration_zone(self, frame: np.ndarray, color=(0, 255, 255),
+                               thickness: int = 2) -> np.ndarray:
+        """Dessine la zone de calibration sur la frame, a titre de controle visuel."""
+
+    @abstractmethod
+    def to_dict(self) -> dict:
+        """Serialise la calibration en dictionnaire (pour export JSON)."""
+
+    def save(self, path: Union[str, Path]) -> None:
+        """Sauvegarde la calibration au format JSON."""
+        path = Path(path)
+        path.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+        logger.info("Calibration sauvegardee dans %s", path)
 
 
 def _polygon_area(points: np.ndarray) -> float:
@@ -61,8 +95,9 @@ def validate_points(pts_image: np.ndarray, pts_world: np.ndarray) -> None:
         )
 
 
-class HomographyCalibrator:
-    """Gere la transformation de perspective image -> plan metrique.
+class HomographyCalibrator(BaseCalibrator):
+    """Gere la transformation de perspective image -> plan metrique a partir
+    de 4 points cliques manuellement.
 
     Tous les points doivent etre coplanaires (surface de la route).
     """
@@ -115,6 +150,7 @@ class HomographyCalibrator:
     def to_dict(self) -> dict:
         """Serialise la calibration en dictionnaire (pour export JSON)."""
         return {
+            "type": "manual",
             "pts_image": self.pts_image.tolist(),
             "pts_world": self.pts_world.tolist(),
         }
@@ -127,19 +163,15 @@ class HomographyCalibrator:
             pts_world=np.array(data["pts_world"], dtype=np.float32),
         )
 
-    def save(self, path: Union[str, Path]) -> None:
-        """Sauvegarde la calibration au format JSON."""
-        path = Path(path)
-        path.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
-        logger.info("Calibration sauvegardee dans %s", path)
-
     @classmethod
     def load(cls, path: Union[str, Path]) -> "HomographyCalibrator":
-        """Charge une calibration depuis un fichier JSON.
+        """Charge une calibration manuelle depuis un fichier JSON.
 
         Raises:
             FileNotFoundError: si le fichier n'existe pas.
-            CalibrationError: si le contenu est invalide.
+            CalibrationError: si le contenu est invalide ou correspond a un
+                autre type de calibration (utilisez load_calibration() pour
+                un chargement generique).
         """
         path = Path(path)
         if not path.exists():
@@ -147,6 +179,50 @@ class HomographyCalibrator:
 
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            return cls.from_dict(data)
-        except (KeyError, json.JSONDecodeError) as exc:
+        except json.JSONDecodeError as exc:
             raise CalibrationError(f"Fichier de calibration invalide ({path}) : {exc}") from exc
+
+        calib_type = data.get("type", "manual")
+        if calib_type != "manual":
+            raise CalibrationError(
+                f"{path} contient une calibration de type '{calib_type}', "
+                f"utilisez trafficpulse.calibration.load_calibration() pour la charger."
+            )
+
+        try:
+            return cls.from_dict(data)
+        except KeyError as exc:
+            raise CalibrationError(f"Fichier de calibration invalide ({path}) : cle manquante {exc}") from exc
+
+
+def load_calibration(path: Union[str, Path]) -> BaseCalibrator:
+    """Charge un fichier de calibration JSON, manuel ou automatique.
+
+    Inspecte le champ "type" du fichier pour instancier la bonne classe.
+    Les fichiers anterieurs sans champ "type" sont traites comme manuels,
+    pour rester compatibles avec les calibrations existantes.
+
+    Raises:
+        FileNotFoundError: si le fichier n'existe pas.
+        CalibrationError: si le contenu est invalide ou le type inconnu.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Fichier de calibration introuvable : {path}")
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise CalibrationError(f"Fichier de calibration invalide ({path}) : {exc}") from exc
+
+    calib_type = data.get("type", "manual")
+
+    if calib_type == "manual":
+        return HomographyCalibrator.from_dict(data)
+
+    if calib_type == "auto":
+        # Import tardif : evite une dependance circulaire entre les deux modules.
+        from trafficpulse.auto_calibration import AutoHomographyCalibrator
+        return AutoHomographyCalibrator.from_dict(data)
+
+    raise CalibrationError(f"Type de calibration inconnu dans {path} : {calib_type!r}")

@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 
 from trafficpulse.annotation import VEHICLE_CLASS_IDS, VEHICLE_CLASSES, annotate_frame
-from trafficpulse.calibration import HomographyCalibrator
+from trafficpulse.calibration import BaseCalibrator
 from trafficpulse.config import PipelineConfig
 from trafficpulse.tracking import SpeedEstimator
 
@@ -112,7 +112,7 @@ class TrafficPulsePipeline:
         self,
         input_path: Union[str, Path],
         output_path: Union[str, Path],
-        calibrator: HomographyCalibrator,
+        calibrator: BaseCalibrator,
         progress_callback: Optional[ProgressCallback] = None,
         csv_export_path: Optional[Union[str, Path]] = None,
     ) -> PipelineStats:
@@ -207,7 +207,7 @@ class TrafficPulsePipeline:
         self,
         frame: np.ndarray,
         frame_idx: int,
-        calibrator: HomographyCalibrator,
+        calibrator: BaseCalibrator,
         speed_estimator: SpeedEstimator,
         vehicles: Dict[int, VehicleRecord],
         class_counts: Dict[str, int],

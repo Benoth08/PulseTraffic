@@ -47,16 +47,17 @@ Le projet separe strictement la logique metier de l'interface utilisateur. Le pa
 | Module | Role |
 |---|---|
 | `trafficpulse/config.py` | Parametres du pipeline (dataclass validee), detection automatique du device |
-| `trafficpulse/calibration.py` | Calibrateur homographique, validation geometrique, sauvegarde/chargement JSON |
+| `trafficpulse/calibration.py` | Calibration manuelle (4 points), interface commune `BaseCalibrator`, chargement JSON generique |
+| `trafficpulse/auto_calibration.py` | Calibration automatique par appariement de points d'interet (SIFT + RANSAC) |
 | `trafficpulse/tracking.py` | Estimation de vitesse a partir de l'historique de positions |
 | `trafficpulse/annotation.py` | Classes vehicules et annotation visuelle des frames |
 | `trafficpulse/pipeline.py` | Orchestration complete : detection, suivi, vitesse, export CSV |
 | `cli.py` | Point d'entree ligne de commande (traitement par lot, scripts) |
 | `app.py` | Interface Streamlit, consommateur du package, aucune logique dupliquee |
-| `calibration_tool.py` | Outil interactif de selection des points de calibration |
-| `tests/` | Tests unitaires de la calibration et de l'estimation de vitesse |
+| `calibration_tool.py` | Outil interactif de selection des points de calibration manuelle |
+| `tests/` | Tests unitaires de la calibration (manuelle et automatique) et de l'estimation de vitesse |
 
-`app.py` et `cli.py` appellent tous les deux `TrafficPulsePipeline`, ce qui garantit un comportement identique quelle que soit l'interface utilisee.
+`app.py` et `cli.py` appellent tous les deux `TrafficPulsePipeline`, ce qui garantit un comportement identique quelle que soit l'interface utilisee. Le pipeline accepte indifferemment une calibration manuelle ou automatique : les deux implementent la meme interface (`BaseCalibrator`).
 
 ## Stack technique
 
@@ -65,6 +66,7 @@ Le projet separe strictement la logique metier de l'interface utilisateur. Le pa
 | Detection | YOLO11n (COCO pre-entraine) | Classes vehicules natives, zero fine-tuning |
 | Tracking | ByteTrack (Ultralytics natif) | Filtre de Kalman + association IoU |
 | Geometrie | OpenCV (getPerspectiveTransform) | Projection image -> plan metrique |
+| Calibration automatique | OpenCV (SIFT + BFMatcher + RANSAC) | Mise en correspondance automatique avec une image de reference a l'echelle connue |
 | Cinematique | NumPy | Derivee discrete lissee V = d/dt |
 | Video I/O | OpenCV (VideoCapture/Writer), repli automatique de codec | Lecture et ecriture MP4 |
 | Interface | Streamlit | Upload + parametrage + telechargement resultat |
@@ -94,12 +96,14 @@ PulseTraffic/
     __init__.py
     config.py
     calibration.py
+    auto_calibration.py
     tracking.py
     annotation.py
     pipeline.py
     logging_utils.py
   tests/
     test_calibration.py
+    test_auto_calibration.py
     test_tracking.py
   traffic_video.mp4            (video de test a fournir, non versionnee)
 ```
@@ -141,7 +145,11 @@ python cli.py \
 
 ## Calibration de l'homographie
 
-C'est l'etape critique qui requiert une intervention manuelle :
+Deux approches sont disponibles, toutes deux produisant un objet calibrateur compatible avec le pipeline (interface `BaseCalibrator`).
+
+### Calibration manuelle (4 points cliques)
+
+Methode de reference, fiable et previsible :
 
 1. Identifier dans la video un rectangle au sol de dimensions connues (passage pieton, marquage de voie, espacement entre bandes blanches)
 2. Relever les 4 coins en pixels (P1 bas-gauche, P2 bas-droit, P3 haut-droit, P4 haut-gauche)
@@ -153,7 +161,34 @@ Deux methodes pour obtenir ces points :
 - `python calibration_tool.py traffic_video.mp4 calibration.json` : outil interactif en local (clic sur l'image), genere directement le fichier JSON
 - Saisie manuelle des 8 valeurs dans la barre laterale de l'interface Streamlit, avec export possible vers JSON
 
-Les points de calibration sont valides automatiquement avant tout traitement : un quadrilatere degenere (points confondus ou alignes) est rejete avec un message explicite plutot que de produire des vitesses silencieusement fausses.
+### Calibration automatique (SIFT + RANSAC)
+
+Plutot que de cliquer des points, cette methode appaire automatiquement la frame camera avec une image de reference du meme site dont l'echelle est connue (orthophoto, plan, capture satellite). Le principe :
+
+1. Detection de points d'interet (SIFT) dans la frame camera et dans l'image de reference
+2. Mise en correspondance brute-force (BFMatcher) filtree par le test du rapport de Lowe
+3. Estimation robuste de l'homographie par RANSAC, qui rejette automatiquement les correspondances aberrantes
+4. Combinaison avec l'echelle de l'image de reference (deduite de deux points dont la distance reelle est connue) pour obtenir directement la projection pixel camera -> metres
+
+```bash
+python cli.py \
+    --input traffic_video.mp4 \
+    --output result.mp4 \
+    --auto-calib \
+    --reference-image plan_site.png \
+    --ref-point1 120,80 \
+    --ref-point2 420,80 \
+    --ref-distance 14.0 \
+    --save-calib calibration_auto.json
+```
+
+`--ref-point1` et `--ref-point2` sont deux points en pixels dans l'image de reference, `--ref-distance` leur distance reelle en metres (par exemple la largeur connue d'une chaussee sur le plan). `--save-calib` permet de conserver le resultat pour le reutiliser tel quel via `--calib-file`, sans recalculer l'appariement a chaque execution.
+
+Cette methode depend de la qualite et du recouvrement de l'image de reference : un faible taux d'inliers (journalise a l'execution) signale une calibration peu fiable, auquel cas la methode manuelle reste preferable.
+
+### Validation commune
+
+Quelle que soit la methode, les points de calibration manuelle sont valides automatiquement avant tout traitement : un quadrilatere degenere (points confondus ou alignes) est rejete avec un message explicite plutot que de produire des vitesses silencieusement fausses. Pour la calibration automatique, un nombre insuffisant de correspondances fiables declenche egalement une erreur explicite plutot qu'une homographie aberrante.
 
 ## Concepts physiques cles
 
@@ -182,7 +217,7 @@ pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-Les tests couvrent la calibration (precision de projection sur points connus, rejet des quadrilateres degeneres, sauvegarde/chargement JSON) et l'estimation de vitesse (calcul sur deplacement connu, filtrage des vitesses aberrantes, liberation memoire des vehicules inactifs). Ils ne dependent ni du modele YOLO ni d'une video, et s'executent en moins d'une seconde.
+Les tests couvrent la calibration manuelle (precision de projection sur points connus, rejet des quadrilateres degeneres, sauvegarde/chargement JSON), la calibration automatique (recuperation d'une homographie connue sur un cas synthetique, rejet des images sans texture exploitable, serialisation) et l'estimation de vitesse (calcul sur deplacement connu, filtrage des vitesses aberrantes, liberation memoire des vehicules inactifs). Ils ne dependent ni du modele YOLO ni d'une video reelle, et s'executent en moins de deux secondes.
 
 ## Limitations
 
@@ -192,6 +227,7 @@ Les tests couvrent la calibration (precision de projection sur points connus, re
 - **Changements d'identifiant de suivi** : le tracker peut perdre un vehicule (occlusion) et generer des vitesses aberrantes, filtrees par seuil configurable
 - **FPS critique** : en dessous de 15 fps, l'estimation de vitesse se degrade
 - **Codec video** : le writer tente H264 (avc1) en priorite pour une lecture native dans le navigateur, avec repli automatique sur mp4v puis XVID selon les codecs disponibles sur le systeme
+- **Calibration automatique** : la fiabilite depend du recouvrement et de la texture de l'image de reference ; une scene peu texturee (chaussee uniforme, vue trop eloignee) peut ne pas fournir assez de correspondances fiables, auquel cas la calibration manuelle reste la methode de repli
 
 ## Extensions possibles
 
